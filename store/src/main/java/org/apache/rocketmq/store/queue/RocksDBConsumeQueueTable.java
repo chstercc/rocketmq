@@ -123,44 +123,32 @@ public class RocksDBConsumeQueueTable {
     }
 
     public List<ByteBuffer> rangeQuery(final String topic, final int queueId, final long startIndex, final int num) throws RocksDBException {
+        final List<ByteBuffer> result = new ArrayList<>(num);
+        if (num == 0) {
+            return result;
+        }
+        // A single point lookup avoids paying for an iterator when there is no range to scan.
+        if (num == 1) {
+            ByteBuffer value = getCQInKV(topic, queueId, startIndex);
+            if (value != null) {
+                result.add(value);
+            }
+            return result;
+        }
         final byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
-        final List<ColumnFamilyHandle> defaultCFHList = new ArrayList<>(num);
-        final ByteBuffer[] resultList = new ByteBuffer[num];
-        final List<Integer> kvIndexList = new ArrayList<>(num);
-        final List<byte[]> kvKeyList = new ArrayList<>(num);
-        for (int i = 0; i < num; i++) {
-            final ByteBuffer keyBB = buildCQKeyByteBuffer(topicBytes, queueId, startIndex + i);
-            kvIndexList.add(i);
-            kvKeyList.add(keyBB.array());
-            defaultCFHList.add(this.defaultCFH);
-        }
-        int keyNum = kvIndexList.size();
-        if (keyNum > 0) {
-            List<byte[]> kvValueList = this.rocksDBStorage.multiGet(defaultCFHList, kvKeyList);
-            final int valueNum = kvValueList.size();
-            if (keyNum != valueNum) {
-                throw new RocksDBException("rocksdb bug, multiGet");
+        final byte[] startKey = buildCQKeyByteBuffer(topicBytes, queueId, startIndex).array();
+        final byte[] endKey = buildCQKeyByteBuffer(topicBytes, queueId, startIndex + num).array();
+        // CQ offsets are contiguous. A missing first row or an internal gap must still return only
+        // the prefix available from startIndex, exactly as the previous multiGet implementation did.
+        this.rocksDBStorage.iterateCQ(startKey, endKey, (key, value) -> {
+            long offset = ByteBuffer.wrap(key).getLong(key.length - Long.BYTES);
+            if (offset != startIndex + result.size()) {
+                return false;
             }
-            for (int i = 0; i < valueNum; i++) {
-                byte[] value = kvValueList.get(i);
-                if (value == null) {
-                    continue;
-                }
-                ByteBuffer byteBuffer = ByteBuffer.wrap(value);
-                resultList[kvIndexList.get(i)] = byteBuffer;
-            }
-        }
-
-        final int resultSize = resultList.length;
-        List<ByteBuffer> bbValueList = new ArrayList<>(resultSize);
-        for (int i = 0; i < resultSize; i++) {
-            ByteBuffer byteBuffer = resultList[i];
-            if (byteBuffer == null) {
-                break;
-            }
-            bbValueList.add(byteBuffer);
-        }
-        return bbValueList;
+            result.add(ByteBuffer.wrap(value));
+            return result.size() < num;
+        });
+        return result;
     }
 
     /**

@@ -19,6 +19,7 @@ package org.apache.rocketmq.store.rocksdb;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiPredicate;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.config.AbstractRocksDBStorage;
 import org.apache.rocketmq.common.constant.LoggerName;
@@ -33,6 +34,7 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.Slice;
 import org.rocksdb.WriteBatch;
 
 public class ConsumeQueueRocksDBStorage extends AbstractRocksDBStorage {
@@ -116,6 +118,35 @@ public class ConsumeQueueRocksDBStorage extends AbstractRocksDBStorage {
     public List<byte[]> multiGet(final List<ColumnFamilyHandle> cfhList,
         final List<byte[]> keys) throws RocksDBException {
         return multiGet(this.totalOrderReadOptions, cfhList, keys);
+    }
+
+    /**
+     * Scan a bounded CQ key range, stopping when the callback returns false. The upper bound is
+     * exclusive; unlike an unbounded metadata scan, a short CQ read needs no explicit readahead.
+     */
+    public void iterateCQ(final byte[] start, final byte[] end,
+        final BiPredicate<byte[], byte[]> callback) throws RocksDBException {
+        if (!hold()) {
+            throw new IllegalStateException("rocksDB:" + this + " is not ready");
+        }
+        try (Slice lowerBound = new Slice(start);
+            Slice upperBound = new Slice(end);
+            ReadOptions options = new ReadOptions()
+                .setTotalOrderSeek(true)
+                .setIterateLowerBound(lowerBound)
+                .setIterateUpperBound(upperBound);
+            RocksIterator iterator = this.db.newIterator(this.defaultCFHandle, options)) {
+            iterator.seek(start);
+            while (iterator.isValid()) {
+                if (!callback.test(iterator.key(), iterator.value())) {
+                    break;
+                }
+                iterator.next();
+            }
+            iterator.status();
+        } finally {
+            release();
+        }
     }
 
     public void batchPut(final WriteBatch batch) throws RocksDBException {
